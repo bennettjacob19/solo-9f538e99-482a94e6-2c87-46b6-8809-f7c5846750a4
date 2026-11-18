@@ -63,12 +63,31 @@ class CaptureWorker:
 
     # ----------------------------------------------------------------- main
     def _run(self) -> None:
-        self._source.ensure_schema()
-        state = self._store.get_state()
-        if state.get("baseline_lsn"):
-            log.info("resuming capture from slot %s", self._settings.slot_name)
-        else:
-            self._initialize()
+        # 初始化（建表/建槽/基线）依赖源库可用。源库启动慢或短暂不可达时
+        # 不永久降级为 ERROR，而是按退避重试，直到 stop 被置位；这样本地
+        # 直跑与容器重启策略之外也具备自愈能力。
+        backoff = max(1, self._settings.reconnect_backoff_s)
+        while not self._stop.is_set():
+            try:
+                self._source.ensure_schema()
+                state = self._store.get_state()
+                if state.get("baseline_lsn"):
+                    log.info("resuming capture from slot %s",
+                             self._settings.slot_name)
+                else:
+                    self._initialize()
+                break
+            except Exception as exc:
+                if self._stop.is_set():
+                    return
+                log.warning(
+                    "capture initialization failed: %r; retrying in %ds",
+                    exc, backoff, exc_info=True,
+                )
+                self._store.mark_error(
+                    f"capture initialization failed (retrying): {exc}"
+                )
+                self._stop.wait(backoff)
         self._stream_forever()
 
     def _start_inflight_hook(self):
@@ -246,6 +265,21 @@ class CaptureWorker:
             commit_ts = raw_commit_msg.split(marker, 1)[1].rstrip(")")
 
         lsn_text = f"{commit_lsn >> 32:X}/{commit_lsn & 0xFFFFFFFF:08X}"
+
+        # 空事务（如 ensure_schema 的 CREATE ... IF NOT EXISTS DDL，或其他
+        # 与 artifacts 无关的提交）不产生任何制品变更：不落盘为提交点，也不
+        # 回送 feedback。槽位因此停在上一个真实制品提交点之前/之上，保持
+        # “confirmed_flush_lsn 永不超前已落盘提交点”的不变量；该空事务在
+        # 后续重连/重启时会被再次重放并再次安全跳过，幂等且无副作用。
+        if not changes:
+            log.info(
+                "txn %s at %s has no artifact change, skip persist and feedback",
+                xid, lsn_text,
+            )
+            self._current_changes = []
+            self._current_xid = None
+            return
+
         written = self._store.persist_transaction(
             xid, lsn_text, commit_ts, changes
         )

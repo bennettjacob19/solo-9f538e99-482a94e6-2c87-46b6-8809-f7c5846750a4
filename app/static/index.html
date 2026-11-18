@@ -29,6 +29,9 @@
   .badge.STREAMING { background:#dafbe1; color:var(--ok); }
   .badge.INITIALIZING { background:#fff8c5; color:var(--warn); }
   .badge.ERROR { background:#ffebe9; color:var(--err); }
+  .badge.ACTIVE { background:#dafbe1; color:var(--ok); }
+  .badge.EXPIRED { background:#f6f8fa; color:#656d76; }
+  .badge.RELEASED { background:#ffebe9; color:var(--err); }
   .muted { color:#656d76; font-size:12px; }
   .msg { margin-top:8px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
@@ -60,12 +63,54 @@
       <button onclick="addOp('delete')">+ 删除</button>
       <button class="primary" onclick="submitOps()">整组提交</button>
     </div>
-    <div class="muted" style="margin-top:6px;">sha256 需 64 位十六进制；任一操作失败整组回滚。</div>
+    <div class="muted" style="margin-top:6px;">sha256 需 64 位十六进制；任一操作失败整组回滚。命中在保冻结的编号会被源库触发器拒绝。</div>
     <div class="msg" id="ops-msg"></div>
   </section>
 
   <section class="card full">
-    <h2>③ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
+    <h2>③ 写入冻结申请（发布窗口防换版）</h2>
+    <div class="muted" style="margin-bottom:8px;">
+      选择一个已捕获提交点与该点存在的制品编号，申请后源库触发器将拒绝网页与直接 SQL
+      对受保护编号的 UPDATE/DELETE；申请时若当前四列与提交点不一致，整组不生效。
+    </div>
+    <div style="display:grid; grid-template-columns: 1.2fr 1fr 1fr auto; gap:8px; align-items:end;">
+      <div><div class="muted">依据提交点 LSN</div>
+        <select id="fz-point"></select></div>
+      <div><div class="muted">冻结时长（分钟）</div>
+        <select id="fz-duration">
+          <option value="1">1 分钟（测试）</option>
+          <option value="5">5 分钟</option>
+          <option value="30">30 分钟</option>
+          <option value="60">1 小时</option>
+          <option value="240">4 小时</option>
+          <option value="1440">1 天</option>
+        </select></div>
+      <div><div class="muted">事由（可选）</div>
+        <input id="fz-reason" maxlength="500" placeholder="如：发布窗口 11/18 22:00"></div>
+      <button class="primary" onclick="submitFreeze()">申请冻结所选编号</button>
+    </div>
+    <div style="margin-top:10px;">
+      <div class="muted">勾选该提交点目录中要冻结的编号：</div>
+      <table style="margin-top:6px;">
+        <thead><tr><th style="width:42px;">选择</th><th>编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>当前冻结状态</th></tr></thead>
+        <tbody id="fz-dir"><tr><td colspan="6" class="muted">请先选择提交点</td></tr></tbody>
+      </table>
+    </div>
+    <div class="msg" id="fz-msg"></div>
+  </section>
+
+  <section class="card full">
+    <h2>④ 冻结清单（查看 / 释放；重启后未到期继续生效，到期自动放行）</h2>
+    <table>
+      <thead><tr><th>ID</th><th>编号</th><th>依据提交点</th><th>服务名</th><th>版本</th><th>SHA-256</th>
+        <th>申请时间</th><th>到期时间</th><th>释放时间</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="freezes"><tr><td colspan="11" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <div style="margin-top:8px;"><label class="muted"><input type="checkbox" id="fz-history" onchange="refreshFreezes()"> 同时显示已释放/已到期历史</label></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
     <table>
       <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
       <tbody id="points"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
@@ -74,7 +119,7 @@
   </section>
 
   <section class="card full">
-    <h2>④ 单编号完整历史（含删除/重用）</h2>
+    <h2>⑥ 单编号完整历史（含删除/重用）</h2>
     <div style="display:flex; gap:8px; max-width:420px;">
       <input id="hist-no" type="number" min="1" placeholder="制品编号，如 1001">
       <button onclick="loadHistory()">查询</button>
@@ -168,7 +213,7 @@ async function refreshPoints(){
   try {
     const r = await getJSON('/api/points');
     pointsCache = r.points;
-    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; return; }
+    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; syncFreezePointOptions(); return; }
     tb.innerHTML = r.points.map(p => `
       <tr class="point-row" onclick="viewDirectory('${esc(p.lsn)}')">
         <td><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
@@ -177,6 +222,7 @@ async function refreshPoints(){
         <td>${esc(p.commit_ts ?? '—')}</td>
         <td>${p.change_count}</td>
       </tr>`).join('');
+    syncFreezePointOptions();
   } catch(e){
     tb.innerHTML = `<tr><td colspan="5" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
   }
@@ -212,10 +258,97 @@ async function loadHistory(){
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 
+// ---------------------------------------------------------------- 写入冻结
+let freezeCache = [];
+async function refreshFreezes(){
+  const tb = document.getElementById('freezes');
+  const withHistory = document.getElementById('fz-history').checked;
+  try {
+    const r = await getJSON('/api/freezes?include_expired=' + (withHistory ? 'true' : 'false'));
+    freezeCache = r.freezes;
+    if (!r.freezes.length) { tb.innerHTML = '<tr><td colspan="11" class="muted">暂无冻结记录</td></tr>'; return; }
+    tb.innerHTML = r.freezes.map(f => {
+      const status = f.active ? 'ACTIVE' : (f.released_at ? 'RELEASED' : 'EXPIRED');
+      return `<tr>
+        <td>${f.id}</td><td>${f.artifact_no}</td><td><code>${esc(f.point_lsn)}</code></td>
+        <td>${esc(f.service_name)}</td><td>${esc(f.version)}</td><td><code>${esc(f.sha256)}</code></td>
+        <td class="muted">${esc(f.created_at)}</td><td>${esc(f.expires_at)}</td>
+        <td class="muted">${esc(f.released_at ?? '—')}</td>
+        <td><span class="badge ${status}">${status}</span></td>
+        <td>${f.released_at ? '—' : `<button class="danger" onclick="releaseFreeze(${f.id})">释放</button>`}</td>
+      </tr>`;
+    }).join('');
+  } catch(e){ tb.innerHTML = `<tr><td colspan="11" class="msg err">${esc(e.message)}</td></tr>`; }
+}
+
+async function releaseFreeze(id){
+  if (!confirm('确认释放冻结 #' + id + ' ？释放后该编号立即恢复可写。')) return;
+  try {
+    await getJSON('/api/freezes/release', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({freeze_id: id})
+    });
+    setMsg('fz-msg', '冻结 #' + id + ' 已释放', 'ok');
+    refreshFreezes(); loadFreezeDirectory();
+  } catch(e){ setMsg('fz-msg', '释放失败：' + e.message, 'err'); }
+}
+
+// 提交点下拉随提交点列表一起刷新
+function syncFreezePointOptions(){
+  const sel = document.getElementById('fz-point');
+  const current = sel.value;
+  if (!pointsCache.length) { sel.innerHTML = '<option value="">（暂无提交点）</option>'; return; }
+  sel.innerHTML = pointsCache.map(p =>
+    `<option value="${esc(p.lsn)}">${esc(p.kind)} ${esc(p.lsn)}（${p.change_count} 行）</option>`).join('');
+  if (current) sel.value = current;
+}
+
+async function loadFreezeDirectory(){
+  const lsn = document.getElementById('fz-point').value;
+  const tb = document.getElementById('fz-dir');
+  if (!lsn) { tb.innerHTML = '<tr><td colspan="6" class="muted">请先选择提交点</td></tr>'; return; }
+  try {
+    const [dirResp, fzResp] = await Promise.all([
+      getJSON('/api/directory?point=' + encodeURIComponent(lsn)),
+      getJSON('/api/freezes')
+    ]);
+    const activeByNo = {};
+    for (const f of fzResp.freezes) if (f.active) activeByNo[f.artifact_no] = f;
+    tb.innerHTML = dirResp.artifacts.map(a => {
+      const f = activeByNo[a.artifact_no];
+      const state = f ? `<span class="badge ACTIVE">在保 #${f.id} 至 ${esc(f.expires_at)}</span>`
+                      : '<span class="muted">未冻结</span>';
+      return `<tr>
+        <td><input type="checkbox" class="fz-pick" value="${a.artifact_no}" ${f ? 'disabled' : ''}></td>
+        <td>${a.artifact_no}</td><td>${esc(a.service_name)}</td><td>${esc(a.version)}</td>
+        <td><code>${esc(a.sha256)}</code></td><td>${state}</td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="muted">该提交点目录为空</td></tr>';
+  } catch(e){ tb.innerHTML = `<tr><td colspan="6" class="msg err">${esc(e.message)}</td></tr>`; }
+}
+
+async function submitFreeze(){
+  const point_lsn = document.getElementById('fz-point').value;
+  const duration_minutes = Number(document.getElementById('fz-duration').value);
+  const reason = document.getElementById('fz-reason').value.trim();
+  const artifact_nos = [...document.querySelectorAll('.fz-pick:checked')].map(c => Number(c.value));
+  if (!point_lsn) return setMsg('fz-msg', '请选择依据提交点', 'err');
+  if (!artifact_nos.length) return setMsg('fz-msg', '请勾选至少一个制品编号', 'err');
+  try {
+    const r = await getJSON('/api/freezes', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({point_lsn, artifact_nos, duration_minutes, reason})
+    });
+    setMsg('fz-msg', `冻结申请成功：${r.frozen} 个编号，时长 ${r.duration_seconds} 秒，冻结 ID ${r.freeze_ids.join(',')}`, 'ok');
+    refreshFreezes(); loadFreezeDirectory();
+  } catch(e){ setMsg('fz-msg', '冻结申请被拒绝（整组未生效）：' + e.message, 'err'); }
+}
+
 addOp('insert');
-refreshProgress(); refreshPoints();
+refreshProgress(); refreshPoints(); refreshFreezes();
+document.getElementById('fz-point').addEventListener('change', loadFreezeDirectory);
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
+setInterval(refreshFreezes, 5000);
 </script>
 </body>
 </html>

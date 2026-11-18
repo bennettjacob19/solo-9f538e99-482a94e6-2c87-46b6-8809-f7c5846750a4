@@ -274,6 +274,102 @@ echo "=== 7. 两侧持久化 ==="
 [ -f "$SQLDIR/history.db" ] && ok "SQLite 历史库落盘: $SQLDIR/history.db" || bad "SQLite 未落盘"
 [ -d "$PGDATA/pg_wal" ] && ok "PostgreSQL 数据目录持久化: $PGDATA" || bad "PG 数据目录缺失"
 
+# ------------------------------------------------------------- 8. 写入冻结：申请、强制拦截、其他编号可写
+echo "=== 8. 写入冻结强制力（网页 + 直接 SQL）==="
+fz_point=$(api /api/points | jq -r '.points[-1].lsn')
+# 8.1 正常申请 1001，冻结 1 分钟（同时覆盖到期自动放行）
+code=$(curl -s -o /tmp/fz.json -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' \
+  -d "{\"point_lsn\":\"$fz_point\",\"artifact_nos\":[1001],\"duration_minutes\":1,\"reason\":\"selftest\"}")
+check "$code" "201" "冻结申请成功 201"
+fid=$(jq -r '.freeze_ids[0]' /tmp/fz.json)
+[ "$fid" -gt 0 ] 2>/dev/null && ok "返回冻结 id=$fid" || bad "冻结 id 异常: $(cat /tmp/fz.json)"
+check "$(api /api/freezes | jq "[.freezes[]|select(.active and .artifact_no==1001)]|length")" \
+      "1" "冻结清单显示 1001 在保"
+# 8.2 网页 UPDATE 被拒且整事务回滚
+code=$(curl -s -o /tmp/fz.json -w '%{http_code}' -X POST "$BASE/api/source/operations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"hack\",\"sha256\":\"$SHA64\"}]}")
+check "$code" "400" "网页 UPDATE 在保编号被触发器拒绝 400"
+# 8.3 直接 SQL UPDATE/DELETE 被拒（psql 直连，绕过网页）
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -v ON_ERROR_STOP=1 \
+  -c "update artifacts set version='sql-hack' where artifact_no=1001" 2>/tmp/fz-err.txt
+[ $? -ne 0 ] && ok "直接 SQL UPDATE 在保编号失败" || bad "直接 SQL UPDATE 未被拦截"
+grep -q P0001 /tmp/fz-err.txt && ok "拒绝来自源库触发器（SQLSTATE P0001）" || bad "错误码不是 P0001"
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -v ON_ERROR_STOP=1 \
+  -c "delete from artifacts where artifact_no=1001" 2>/tmp/fz-err.txt
+[ $? -ne 0 ] && ok "直接 SQL DELETE 在保编号失败" || bad "直接 SQL DELETE 未被拦截"
+# 8.4 同事务混合：未冻结编号 + 在保编号，整体回滚，未冻结编号也不变
+ver_before=$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select version from artifacts where artifact_no=1003" | tr -d '[:space:]')
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -v ON_ERROR_STOP=1 >/tmp/fz-err.txt 2>&1 <<SQL || true
+BEGIN;
+UPDATE artifacts SET version='should-rollback' WHERE artifact_no=1003;
+UPDATE artifacts SET version='should-rollback' WHERE artifact_no=1001;
+COMMIT;
+SQL
+ver_after=$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select version from artifacts where artifact_no=1003" | tr -d '[:space:]')
+check "$ver_after" "$ver_before" \
+  "同事务命中冻结导致整笔源事务回滚，其他编号改动一并撤销（保持 $ver_before）"
+# 8.5 其他编号仍可正常修改
+curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/source/operations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"operations\":[{\"op\":\"update\",\"artifact_no\":1003,\"service_name\":\"notify-hub\",\"version\":\"10.10.10\",\"sha256\":\"ffeeddccbbaa9988776655443322110099887766554433221100998877665544\"}]}" > /tmp/fz-code.txt
+check "$(cat /tmp/fz-code.txt)" "200" "未冻结编号 1003 仍可正常写入"
+# 8.6 快照不一致整组拒绝：先用一个更早点申请当前已改版的 1003
+old_point=$(api /api/points | jq -r '.points[0].lsn')
+code=$(curl -s -o /tmp/fz.json -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' \
+  -d "{\"point_lsn\":\"$old_point\",\"artifact_nos\":[1003],\"duration_minutes\":5}")
+check "$code" "409" "当前值与提交点不一致时整组冻结申请不生效 409"
+check "$(api /api/freezes | jq "[.freezes[]|select(.artifact_no==1003 and .active)]|length")" \
+      "0" "被拒申请未留下任何冻结记录"
+# 8.7 重复申请同一编号被拒
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' \
+  -d "{\"point_lsn\":\"$fz_point\",\"artifact_nos\":[1001],\"duration_minutes\":5}")
+check "$code" "409" "重复冻结在保编号被拒绝 409"
+# 8.8 释放后立即恢复可写
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/freezes/release" \
+  -H 'Content-Type: application/json' -d "{\"freeze_id\":$fid}")
+check "$code" "200" "释放冻结 200"
+curl -s -o /dev/null -X POST "$BASE/api/source/operations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"after-release\",\"sha256\":\"$SHA64\"}]}"
+check "$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select version from artifacts where artifact_no=1001")" "after-release" \
+  "释放后该编号立即恢复可写"
+
+# ------------------------------------------------------------- 9. 冻结到期自动放行 + 重启持久化
+echo "=== 9. 到期自动放行与重启持久化 ==="
+sleep 2
+fz_point2=$(api /api/points | jq -r '.points[-1].lsn')
+fid2=$(curl -s -X POST "$BASE/api/freezes" -H 'Content-Type: application/json' \
+  -d "{\"point_lsn\":\"$fz_point2\",\"artifact_nos\":[1001],\"duration_minutes\":1}" | jq -r '.freeze_ids[0]')
+# 重启应用，冻结记录在源 PostgreSQL 中，须继续在保
+force_kill_app
+start_app "$SQLDIR"
+wait_phase STREAMING 15 || true
+sleep 2
+check "$(api /api/freezes | jq "[.freezes[]|select(.id==$fid2 and .active)]|length")" \
+      "1" "应用重启后未到期冻结继续生效（持久化在源库）"
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -v ON_ERROR_STOP=1 \
+  -c "update artifacts set version='still-frozen' where artifact_no=1001" 2>/tmp/fz-err.txt
+[ $? -ne 0 ] && ok "重启后直接 SQL 仍被冻结拦截" || bad "重启后冻结失效"
+# 等到期（1 分钟冻结，已耗时一部分，最多再等 80 秒）
+for _ in $(seq 1 80); do
+  active=$(api /api/freezes | jq "[.freezes[]|select(.id==$fid2 and .active)]|length")
+  [ "$active" = "0" ] && break
+  sleep 1
+done
+check "$active" "0" "到期后冻结自动转为非在保（无需清扫任务）"
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -v ON_ERROR_STOP=1 \
+  -c "update artifacts set version='expired-ok' where artifact_no=1001" >/dev/null 2>&1
+[ $? -eq 0 ] && ok "到期后直接 SQL 写入自动放行" || bad "到期后仍被拦截"
+check "$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select version from artifacts where artifact_no=1001")" "expired-ok" "到期后写入确实落库"
+
 echo
 echo "================ 自测结果: $PASS passed / $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
