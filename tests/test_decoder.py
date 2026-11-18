@@ -14,6 +14,11 @@ UPDATE = (
     "sha256[text]:'1111'"
 )
 DELETE = "table public.artifacts: DELETE: artifact_no[integer]:1003"
+KEY_MOVE = (
+    "table public.artifacts: UPDATE: old-key: artifact_no[integer]:1004 "
+    "new-tuple: artifact_no[integer]:2004 service_name[text]:'cart svc' "
+    "version[text]:'3.1.0' sha256[text]:'aa'"
+)
 QUOTED = (
     "table public.artifacts: INSERT: artifact_no[integer]:7 "
     "service_name[text]:'it''s a service: x' version[text]:'v 1 2 3' "
@@ -58,6 +63,16 @@ class DecoderTest(unittest.TestCase):
                                         "artifacts"))
         self.assertIsNone(parse_message("DDL: something", "artifacts"))
         self.assertIsNone(parse_message("sequence public.foo: ...", "artifacts"))
+
+    def test_primary_key_move(self):
+        m = parse_message(KEY_MOVE, "artifacts")
+        self.assertEqual(m["kind"], "CHANGE")
+        self.assertEqual(m["change_type"], "UPDATE")
+        self.assertEqual(m["artifact_no"], 2004)
+        self.assertEqual(m["old_artifact_no"], 1004)
+        self.assertEqual(m["service_name"], "cart svc")
+        # 普通 UPDATE 不应带 old_artifact_no
+        self.assertNotIn("old_artifact_no", parse_message(UPDATE, "artifacts"))
 
 
 if __name__ == "__main__":

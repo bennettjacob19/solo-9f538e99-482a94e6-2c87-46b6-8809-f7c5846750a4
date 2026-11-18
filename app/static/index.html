@@ -34,6 +34,13 @@
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
   .point-row { cursor:pointer; }
   .point-row:hover { background:var(--bg); }
+  .chk { width:auto; }
+  .freeze-art { width:100%; }
+  .ops-inline { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .ops-inline select, .ops-inline input { width:auto; min-width:150px; }
+  .badge.active { background:#ffebe9; color:var(--err); }
+  .badge.expired { background:#eaeef2; color:#57606a; }
+  .badge.released { background:#dafbe1; color:var(--ok); }
   .tag { font-size:11px; padding:1px 6px; border-radius:4px; background:var(--bg); border:1px solid var(--bd); }
   .tag.DELETE { color:var(--err); border-color:var(--err); }
   .tag.INSERT, .tag.BASELINE { color:var(--ok); border-color:var(--ok); }
@@ -80,6 +87,23 @@
       <button onclick="loadHistory()">查询</button>
     </div>
     <div id="hist-wrap" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 写入冻结（从提交点选择现存制品，到期自动放行）</h2>
+    <div class="ops-inline" style="margin-bottom:10px;">
+      <select id="freeze-point"></select>
+      <button onclick="loadFreezeCandidates()">载入该提交点目录</button>
+      <span class="muted">冻结时长（秒）</span>
+      <input id="freeze-ttl" type="number" min="5" max="2592000" value="600">
+      <input id="freeze-note" placeholder="备注（可选）" maxlength="500">
+      <button class="primary" onclick="submitFreeze()">申请冻结所选制品</button>
+    </div>
+    <div class="muted">申请时源库当前的服务名/版本/SHA-256 必须与该提交点完全一致，否则整组申请不生效。</div>
+    <div class="msg" id="freeze-msg"></div>
+    <div id="freeze-candidates" style="margin-top:10px;"></div>
+    <h3 style="font-size:14px;margin:16px 0 6px;">冻结组</h3>
+    <div id="freeze-list"><div class="muted">加载中…</div></div>
   </section>
 </main>
 
@@ -212,10 +236,98 @@ async function loadHistory(){
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 
+// ---------------------------------------------------------------- 写入冻结
+async function refreshFreezePoints(){
+  const sel = document.getElementById('freeze-point');
+  try {
+    const r = await getJSON('/api/points');
+    const keep = sel.value;
+    sel.innerHTML = r.points.map(p =>
+      `<option value="${esc(p.lsn)}">${esc(p.kind)} · ${esc(p.lsn)} · ${p.change_count} 行</option>`
+    ).join('');
+    if (keep) sel.value = keep;
+  } catch(e){
+    sel.innerHTML = `<option>${e.status===503 ? '初始化未完成' : esc(e.message)}</option>`;
+  }
+}
+
+let freezeCandidates = [];
+async function loadFreezeCandidates(){
+  const point = document.getElementById('freeze-point').value;
+  if (!point) return;
+  const wrap = document.getElementById('freeze-candidates');
+  try {
+    const r = await getJSON('/api/directory?point=' + encodeURIComponent(point));
+    freezeCandidates = r.artifacts;
+    wrap.innerHTML = `<table><thead><tr><th style="width:40px;"><input type="checkbox" class="chk"
+        onchange="document.querySelectorAll('.freeze-art').forEach(c=>c.checked=this.checked)"></th>
+      <th>制品编号</th><th>服务名</th><th>版本</th><th>SHA-256</th></tr></thead><tbody>
+      ${r.artifacts.map(a=>`<tr><td><input type="checkbox" class="chk freeze-art" value="${a.artifact_no}"></td>
+        <td>${a.artifact_no}</td><td>${esc(a.service_name)}</td><td>${esc(a.version)}</td>
+        <td><code>${esc(a.sha256)}</code></td></tr>`).join('')
+        || '<tr><td colspan="5" class="muted">该时刻目录为空</td></tr>'}</tbody></table>`;
+  } catch(e){ wrap.innerHTML = '<div class="msg err">'+esc(e.message)+'</div>'; }
+}
+
+async function submitFreeze(){
+  const point = document.getElementById('freeze-point').value;
+  const artifact_nos = [...document.querySelectorAll('.freeze-art:checked')].map(c=>Number(c.value));
+  const duration_seconds = Number(document.getElementById('freeze-ttl').value);
+  const note = document.getElementById('freeze-note').value.trim();
+  if (!point) return setMsg('freeze-msg','请先选择提交点','err');
+  if (!artifact_nos.length) return setMsg('freeze-msg','请至少选择一个制品编号','err');
+  if (!Number.isFinite(duration_seconds) || duration_seconds < 5)
+    return setMsg('freeze-msg','冻结时长至少 5 秒','err');
+  try {
+    const r = await getJSON('/api/freezes', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({point, artifact_nos, duration_seconds, note})
+    });
+    setMsg('freeze-msg', `冻结已生效：${r.artifact_nos.join(', ')}，至 ${r.expires_at}`, 'ok');
+    refreshFreezes();
+  } catch(e){
+    setMsg('freeze-msg', '申请未生效：'+e.message, 'err');
+  }
+}
+
+async function releaseFreeze(groupId){
+  try {
+    await getJSON('/api/freezes/'+encodeURIComponent(groupId)+'/release', {method:'POST'});
+    refreshFreezes();
+  } catch(e){ alert('释放失败：'+e.message); }
+}
+
+async function refreshFreezes(){
+  const wrap = document.getElementById('freeze-list');
+  try {
+    const r = await getJSON('/api/freezes');
+    if (!r.freezes.length) { wrap.innerHTML='<div class="muted">暂无冻结记录</div>'; return; }
+    wrap.innerHTML = r.freezes.map(g => `
+      <div style="border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-bottom:10px;">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+          <span class="badge ${esc(g.status)}">${esc(g.status)}</span>
+          <code>${esc(g.group_id)}</code>
+          <span class="muted">提交点 <code>${esc(g.point_lsn)}</code></span>
+          <span class="muted">创建 ${esc(g.created_at)}</span>
+          <span class="muted">到期 ${esc(g.expires_at)}</span>
+          ${g.note ? `<span class="muted">备注：${esc(g.note)}</span>` : ''}
+          ${g.status === 'active' ? `<button class="danger" onclick="releaseFreeze('${esc(g.group_id)}')">释放</button>` : ''}
+        </div>
+        <table style="margin-top:8px;"><thead><tr><th>编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>状态</th></tr></thead>
+        <tbody>${g.artifacts.map(a=>`<tr><td>${a.artifact_no}</td><td>${esc(a.service_name)}</td>
+          <td>${esc(a.version)}</td><td><code>${esc(a.sha256)}</code></td>
+          <td><span class="badge ${esc(a.status)}">${esc(a.status)}</span></td></tr>`).join('')}
+        </tbody></table>
+      </div>`).join('');
+  } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
+}
+
 addOp('insert');
-refreshProgress(); refreshPoints();
+refreshProgress(); refreshPoints(); refreshFreezePoints(); refreshFreezes();
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
+setInterval(refreshFreezePoints, 5000);
+setInterval(refreshFreezes, 3000);
 </script>
 </body>
 </html>

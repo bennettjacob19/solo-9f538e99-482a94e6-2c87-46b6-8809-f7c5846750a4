@@ -269,8 +269,188 @@ curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json
 sleep 2
 check "$(api /api/history/1001 | jq '[.history[]|select(.version=="9.9.9")]|length')" "1" "断连恢复后的变更未丢失"
 
-# ------------------------------------------------------------- 7. 持久化校验
-echo "=== 7. 两侧持久化 ==="
+# ------------------------------------------------------------- 7. 写入冻结
+echo "=== 7. 写入冻结：申请、执行、并发、权限、重启、到期 ==="
+PSQL=(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tA)
+sqlq(){ "${PSQL[@]}" -q -c "$1"; }
+
+# 等捕获追平到指定提交点（/api/points 默认隐藏无 artifacts 变更的事务，
+# 所以用“提交点出现在列表里”判定，而不是比对 last_commit_lsn）
+wait_capture(){
+  local want=$1
+  for _ in $(seq 1 30); do
+    [ "$(api /api/points | jq -r --arg l "$want" '[.points[].lsn]|index($l)')" != "null" ] \
+      && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# 7.1 申请冻结：源库当前值与提交点一致 → 成功
+FREEZE_NO=4001
+FREEZE_VER="7.0.$RANDOM"
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":$FREEZE_NO,\"service_name\":\"freeze-svc\",
+ \"version\":\"$FREEZE_VER\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+freeze_point=$(api /api/points | jq -r '.points[-1].lsn')
+wait_capture "$freeze_point" || true
+gid=$(curl -s -X POST "$BASE/api/freezes" -H 'Content-Type: application/json' -d "{
+ \"point\":\"$freeze_point\",\"artifact_nos\":[$FREEZE_NO],\"duration_seconds\":600,
+ \"note\":\"selftest\"}" | jq -r '.group_id')
+case "$gid" in
+  *-*-*-*-*) ok "按提交点申请冻结成功: $gid" ;;
+  *) bad "冻结申请失败: $gid" ;;
+esac
+check "$(api /api/freezes | jq -r --arg g "$gid" '.freezes[]|select(.group_id==$g)|.status')" \
+      "active" "冻结组状态为 active"
+
+# 7.2 网页改冻结编号 → 409 且整笔源事务回滚（同组其他编号也不生效）
+code=$(curl -s -o /tmp/fz.json -w '%{http_code}' -X POST "$BASE/api/source/operations" \
+  -H 'Content-Type: application/json' -d "{
+ \"operations\":[
+  {\"op\":\"update\",\"artifact_no\":$FREEZE_NO,\"service_name\":\"freeze-svc\",
+   \"version\":\"changed\",\"sha256\":\"$SHA64\"},
+  {\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",
+   \"version\":\"rollback-check\",\"sha256\":\"$SHA64\"}
+ ]}")
+check "$code" "409" "网页改冻结编号返回 409"
+check "$(jq -r '.detail.code' /tmp/fz.json)" "ARTIFACT_FROZEN" "错误码为 ARTIFACT_FROZEN"
+check "$(sqlq "select version from artifacts where artifact_no=$FREEZE_NO")" "$FREEZE_VER" \
+      "冻结编号版本未被网页改掉"
+check "$(sqlq "select version from artifacts where artifact_no=1001")" "9.9.9" \
+      "同组未冻结编号也随整笔源事务回滚"
+
+# 7.3 直接 SQL 改/删冻结编号 → 整笔源事务失败；其他编号仍可写
+if sqlq "update artifacts set version='sql-change' where artifact_no=$FREEZE_NO" 2>&1 \
+    | grep -q 'ARTIFACT_FROZEN'; then
+  ok "直接 SQL UPDATE 冻结编号被拒绝"
+else
+  bad "直接 SQL UPDATE 冻结编号未被拒绝"
+fi
+if sqlq "delete from artifacts where artifact_no=$FREEZE_NO" 2>&1 \
+    | grep -q 'ARTIFACT_FROZEN'; then
+  ok "直接 SQL DELETE 冻结编号被拒绝"
+else
+  bad "直接 SQL DELETE 冻结编号未被拒绝"
+fi
+check "$(sqlq "update artifacts set version='other-editable' where artifact_no=1002 returning 1")" \
+      "1" "未冻结编号仍可直接 SQL 修改"
+check "$(sqlq "select version from artifacts where artifact_no=$FREEZE_NO")" "$FREEZE_VER" \
+      "被拒绝的 SQL 未改变冻结编号"
+
+# 7.4 并发改版交错：两种先手顺序都不能出现“已冻结却已换版”
+RACE_NO=4002
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":$RACE_NO,\"service_name\":\"race-svc\",
+ \"version\":\"1.0.0\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+race_point=$(api /api/points | jq -r '.points[-1].lsn')
+wait_capture "$race_point" || true
+
+# 方向 A：改版先拿守卫行锁并持有 3 秒；冻结申请在它持锁期间到达，
+#         必须等改版提交后重新校验，发现源库已偏离提交点 → 整组拒绝。
+( psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tA > /tmp/raceA.out 2>&1 <<SQL
+BEGIN;
+SELECT artifact_guard_no($RACE_NO);
+SELECT pg_sleep(3);
+UPDATE artifacts SET version='race-changed' WHERE artifact_no=$RACE_NO;
+COMMIT;
+SQL
+) &
+race_pid=$!
+sleep 0.7
+code=$(curl -s -o /tmp/raceA.json -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' -d "{
+ \"point\":\"$race_point\",\"artifact_nos\":[$RACE_NO],\"duration_seconds\":600}")
+wait "$race_pid"
+check "$code" "409" "改版先持锁时，交错到达的冻结申请整组拒绝"
+check "$(jq -r '.detail.code' /tmp/raceA.json)" "FREEZE_CONFLICT" \
+      "交错冻结申请返回 FREEZE_CONFLICT"
+check "$(sqlq "select count(*) from artifact_freezes where artifact_no=$RACE_NO
+ and released_at is null and expires_at > clock_timestamp()")" "0" \
+      "被拒绝的申请没有留下任何冻结"
+check "$(sqlq "select version from artifacts where artifact_no=$RACE_NO")" "race-changed" \
+      "改版按预期提交（未冻结）"
+
+# 方向 B：冻结先提交；改版事务在其后开始 → 改版必须失败
+sleep 2
+race2_point=$(api /api/points | jq -r '.points[-1].lsn'); wait_capture "$race2_point" || true
+race2_gid=$(curl -s -X POST "$BASE/api/freezes" -H 'Content-Type: application/json' -d "{
+ \"point\":\"$race2_point\",\"artifact_nos\":[$RACE_NO],\"duration_seconds\":600}" \
+ | jq -r '.group_id')
+[ -n "$race2_gid" ] && [ "$race2_gid" != "null" ] \
+  && ok "改版提交后按新提交点重新申请冻结成功" || bad "重新申请冻结失败: $race2_gid"
+if psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tA > /tmp/raceB.out 2>&1 <<SQL
+BEGIN;
+UPDATE artifacts SET version='race-bypass' WHERE artifact_no=$RACE_NO;
+COMMIT;
+SQL
+then :; fi
+if grep -q 'ARTIFACT_FROZEN' /tmp/raceB.out; then
+  ok "冻结提交后开始的改版事务被拒绝"
+else
+  bad "冻结提交后改版仍成功: $(cat /tmp/raceB.out)"
+fi
+check "$(sqlq "select version from artifacts where artifact_no=$RACE_NO")" "race-changed" \
+      "并发场景未出现“已冻结却已换版”"
+# 并发场景下未冻结编号仍可修改
+check "$(sqlq "update artifacts set version='race-other' where artifact_no=1003 returning 1")" \
+      "1" "冻结生效期间其他编号仍可修改"
+curl -s -X POST "$BASE/api/freezes/$race2_gid/release" >/dev/null
+
+# 7.5 源库当前值与提交点不一致 → 整组申请不生效
+sleep 2
+after_point=$(api /api/points | jq -r '.points[-1].lsn'); wait_capture "$after_point" || true
+code=$(curl -s -o /tmp/fz2.json -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' -d "{
+ \"point\":\"$race_point\",\"artifact_nos\":[$RACE_NO],\"duration_seconds\":600}")
+check "$code" "409" "源库与提交点不一致时申请被拒绝"
+check "$(jq -r '.detail.code' /tmp/fz2.json)" "FREEZE_CONFLICT" "错误码为 FREEZE_CONFLICT"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/freezes" \
+  -H 'Content-Type: application/json' -d "{
+ \"point\":\"$after_point\",\"artifact_nos\":[987654],\"duration_seconds\":600}")
+check "$code" "400" "该提交点不存在的编号被拒绝"
+
+# 7.6 应用强杀重启后未到期冻结继续生效（冻结事实在源库）
+kill -9 "$(app_pid)" 2>/dev/null || true; sleep 2
+start_app "$SQLDIR" >/dev/null 2>&1
+wait_phase STREAMING 20 || bad "重启后未回到 STREAMING"
+check "$(api /api/freezes | jq -r --arg g "$gid" '.freezes[]|select(.group_id==$g)|.status')" \
+      "active" "应用强杀重启后冻结仍为 active"
+if sqlq "update artifacts set version='after-restart' where artifact_no=$FREEZE_NO" 2>&1 \
+    | grep -q 'ARTIFACT_FROZEN'; then
+  ok "重启后直接 SQL 仍被冻结拦截"
+else
+  bad "重启后冻结失效"
+fi
+
+# 7.7 释放冻结后可写
+curl -s -X POST "$BASE/api/freezes/$gid/release" >/dev/null
+check "$(sqlq "update artifacts set version='released' where artifact_no=$FREEZE_NO returning 1")" \
+      "1" "释放冻结后可直接 SQL 修改"
+
+# 7.8 到期自动放行（先制造一个新的提交点，保证与源库当前值一致）
+sqlq "update artifacts set version='ttl-base' where artifact_no=$FREEZE_NO" >/dev/null
+sleep 2
+ttl_point=$(api /api/points | jq -r '.points[-1].lsn'); wait_capture "$ttl_point" || true
+ttl_gid=$(curl -s -X POST "$BASE/api/freezes" -H 'Content-Type: application/json' \
+  -d "{\"point\":\"$ttl_point\",\"artifact_nos\":[$FREEZE_NO],\"duration_seconds\":6}" \
+  | jq -r '.group_id')
+case "$ttl_gid" in
+  *-*-*-*-*) ok "短时冻结申请成功: $ttl_gid" ;;
+  *) bad "短时冻结申请失败: $ttl_gid" ;;
+esac
+check "$(api /api/freezes | jq -r --arg g "$ttl_gid" '.freezes[]|select(.group_id==$g)|.status')" \
+      "active" "短时冻结初始为 active"
+sleep 8
+check "$(api /api/freezes | jq -r --arg g "$ttl_gid" '.freezes[]|select(.group_id==$g)|.status')" \
+      "expired" "到期后冻结组状态为 expired"
+check "$(sqlq "update artifacts set version='after-expiry' where artifact_no=$FREEZE_NO returning 1")" \
+      "1" "冻结到期后自动允许写入"
+
+# ------------------------------------------------------------- 8. 持久化校验
+echo "=== 8. 两侧持久化 ==="
 [ -f "$SQLDIR/history.db" ] && ok "SQLite 历史库落盘: $SQLDIR/history.db" || bad "SQLite 未落盘"
 [ -d "$PGDATA/pg_wal" ] && ok "PostgreSQL 数据目录持久化: $PGDATA" || bad "PG 数据目录缺失"
 

@@ -241,7 +241,13 @@ class HistoryStore:
                 raise
 
     # ------------------------------------------------------------------ reads
-    def get_points(self) -> list[dict[str, Any]]:
+    def get_points(self, include_empty: bool = False) -> list[dict[str, Any]]:
+        """已捕获的提交点列表。
+
+        include_empty=False（默认）时不列出“没有改动 artifacts”的事务，
+        例如只写了冻结表的申请事务，避免值班页面被无关提交点淹没；
+        但它们仍是合法 LSN，get_point() 仍能识别。
+        """
         with self._lock:
             points: list[dict[str, Any]] = []
             baseline_lsn = self._get_state("baseline_lsn")
@@ -260,12 +266,16 @@ class HistoryStore:
                         "change_count": count,
                     }
                 )
+            having = "" if include_empty else "HAVING COUNT(h.xid) > 0"
             for row in self._conn.execute(
-                """
+                f"""
                 SELECT t.xid, t.commit_lsn, t.commit_lsn_num, t.commit_ts,
-                       (SELECT COUNT(*) FROM artifact_history h
-                         WHERE h.xid = t.xid) AS change_count
-                FROM txns t ORDER BY t.commit_lsn_num, t.xid
+                       COUNT(h.xid) AS change_count
+                FROM txns t
+                LEFT JOIN artifact_history h ON h.xid = t.xid
+                GROUP BY t.xid, t.commit_lsn, t.commit_lsn_num, t.commit_ts
+                {having}
+                ORDER BY t.commit_lsn_num, t.xid
                 """
             ).fetchall():
                 points.append(
@@ -279,6 +289,27 @@ class HistoryStore:
                     }
                 )
             return points
+
+    def get_point(self, lsn_num: int) -> dict[str, Any] | None:
+        """按 LSN 精确判定“是否已捕获提交点”（含无 artifacts 变更的事务）。"""
+        with self._lock:
+            baseline_lsn = self._get_state("baseline_lsn")
+            if baseline_lsn and lsn_to_num(baseline_lsn) == lsn_num:
+                return {"kind": "BASELINE", "lsn": baseline_lsn, "lsn_num": lsn_num}
+            row = self._conn.execute(
+                "SELECT xid, commit_lsn, commit_lsn_num, commit_ts FROM txns"
+                " WHERE commit_lsn_num=?",
+                (lsn_num,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "kind": "TXN",
+                "lsn": row["commit_lsn"],
+                "lsn_num": row["commit_lsn_num"],
+                "xid": row["xid"],
+                "commit_ts": row["commit_ts"],
+            }
 
     def get_directory_at(self, lsn_num: int) -> list[dict[str, Any]]:
         """查看某个提交点（含）为止的整目录：每个编号取最后一条变更。"""

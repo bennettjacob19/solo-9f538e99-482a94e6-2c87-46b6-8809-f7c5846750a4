@@ -63,12 +63,39 @@ class CaptureWorker:
 
     # ----------------------------------------------------------------- main
     def _run(self) -> None:
-        self._source.ensure_schema()
+        # 启动阶段（源库可能还没准备好，例如 Compose 里 postgres 仍在跑
+        # 初始化脚本）失败不能让捕获线程永久退出：重试到成功或收到停止信号。
+        backoff = max(1, self._settings.reconnect_backoff_s)
+        while not self._stop.is_set():
+            try:
+                self._source.ensure_schema()
+                break
+            except Exception as exc:
+                log.warning("源库尚未就绪，稍后重试初始化: %r", exc)
+                self._store.mark_initializing(self._settings.slot_name)
+                self._stop.wait(backoff)
+
         state = self._store.get_state()
-        if state.get("baseline_lsn"):
-            log.info("resuming capture from slot %s", self._settings.slot_name)
+        if not state.get("baseline_lsn") and not self._stop.is_set():
+            while not self._stop.is_set():
+                try:
+                    self._initialize()
+                    break
+                except Exception as exc:
+                    # 基线落盘后若在收尾阶段失败，绝不能重做基线（会重复写入
+                    # BASELINE 行、并丢弃已有槽位）；下一轮回退为“续接”分支。
+                    if self._store.get_state().get("baseline_lsn"):
+                        log.warning(
+                            "基线已落盘，转为续接模式（收尾失败: %r）", exc
+                        )
+                        break
+                    log.warning("初始化失败，重试中: %r", exc)
+                    self._store.mark_initializing(self._settings.slot_name)
+                    self._stop.wait(backoff)
         else:
-            self._initialize()
+            log.info("resuming capture from slot %s", self._settings.slot_name)
+        if not self._store.get_state().get("baseline_lsn"):
+            return  # 收到停止信号且从未建立基线
         self._stream_forever()
 
     def _start_inflight_hook(self):
@@ -228,7 +255,30 @@ class CaptureWorker:
             self._current_xid = parsed["xid"]
             self._current_changes: list[dict[str, Any]] = []
         elif kind == "CHANGE":
-            self._current_changes.append(parsed)
+            # 主键搬移的 UPDATE 拆成“旧编号 DELETE + 新编号 INSERT”，
+            # 否则按提交点重建目录时旧编号会一直残留。
+            old_no = parsed.get("old_artifact_no")
+            if old_no is not None and old_no != parsed["artifact_no"]:
+                self._current_changes.append(
+                    {
+                        "change_type": "DELETE",
+                        "artifact_no": old_no,
+                        "service_name": None,
+                        "version": None,
+                        "sha256": None,
+                    }
+                )
+                self._current_changes.append(
+                    {
+                        "change_type": "INSERT",
+                        "artifact_no": parsed["artifact_no"],
+                        "service_name": parsed.get("service_name"),
+                        "version": parsed.get("version"),
+                        "sha256": parsed.get("sha256"),
+                    }
+                )
+            else:
+                self._current_changes.append(parsed)
         elif kind == "COMMIT":
             # test_decoding: COMMIT 行本身不带 LSN，消息 wal_end 即该事务
             # 提交记录结束位置，用作该提交点的 LSN。
